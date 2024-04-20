@@ -1,102 +1,8 @@
-#include <string.h>
-#include <stdio.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <stdlib.h>
-#include <arpa/inet.h>
-#include <time.h>
-#include <unistd.h>
-#include <ctype.h>
 #include "drone.h"
 #define STDIN 0
-
-/* NOTE: These global variables are needed for the lex.yy.c file.
- * Will restructure and remove global variables for the next lab */
-
-// Needed to save and print key-value pairs
-struct Pairs pairs;
-// Used to keep track of number of key-value pairs in struct
-int num_of_pairs = 0;
-// Used as a flag to indicate whether message sent from client
-// was meant for me
-int is_my_message;
-int is_in_range;
-int is_alive;
-int port_number = 0;
-// Structure that contains coordinates of my drone
-// based on my_location
-struct Coordinates my_coordinates;
-// Dimensions of the grid 
-int num_rows;
-int num_cols;
-
-// Main driver
-int main(int argc, char *argv[])
-{
-    int sd; /* the socket descriptor */
-    struct sockaddr_in drone_address; /* my address */
-    int rc; // always need to check return codes!
-    int num_drones = 0;
-    // Array of drones, can hold up to 50
-    struct Drone drones[50];
-    // Variable that represents my location in the grid
-    int my_location;
-
-    // Check to see if the right number of parameters was entered
-    if (argc < 2)
-    {
-        printf ("usage is drone <port number>\n");
-        exit(1); /* just leave if wrong number entered */
-    }
-
-    // Ask the user to specify the dimensions of the grid
-    printf("Enter the number of columns in the grid: ");
-    scanf("%d", &num_cols);
-    printf("Enter the number of rows in the grid: ");
-    scanf("%d", &num_rows);
-    // Consume the newline character
-    getchar();
-
-    // First create a socket using UDP protocol
-    sd = socket(AF_INET, SOCK_DGRAM, 0); /* create a socket */
-    // Print error and exit if invalid socket descriptor
-    if(sd < 0)
-    {
-        perror("Invalid socket descriptor\n");
-        exit(1);
-    }
-
-    // Check if port num is a num
-    is_port_a_num(argv[1]);
-
-    // Convert from string to long
-    port_number = strtol(argv[1], NULL, 10);
-
-    // Ensure port num is within correct range
-    check_port_range(port_number);
-
-    // Configure the drone_address struct
-    configure_address_struct(&drone_address, port_number, NULL);
-
-    char config_file_name[] = "config.file";
-    // Read the config file first
-    read_file(config_file_name, drones, &num_drones, &my_location);
-
-    // The next step is to bind to the address
-    rc = bind (sd, (struct sockaddr *)&drone_address,
-               sizeof(struct sockaddr ));
-    // Check if there was an error binding to socket
-    if (rc < 0)
-    {
-        perror("bind");
-        exit (1);
-    }
-
-    // Drone will listen for message from network or outgoing
-    // message from stdin
-    listen_for_input(sd, drones, &num_drones, &my_location);
-}
-// End of main
+#define MSG 0
+#define MOV 1
+#define MAX_LEN 512
 
 FILE* open_file(char file_name[]) {
     FILE *file;
@@ -111,7 +17,8 @@ FILE* open_file(char file_name[]) {
     return file;
 }
 
-void read_file(char file_name[], struct Drone drones[], int* num_drones, int* my_location) {
+void read_file(char file_name[], struct Drone drones[], int* num_drones, struct Args *args) {
+    
     size_t len = 0; /* size of the line buffer */
     char *line = NULL;
     FILE* stream = open_file(file_name);
@@ -120,8 +27,8 @@ void read_file(char file_name[], struct Drone drones[], int* num_drones, int* my
     while(getline(&line, &len, stream) != -1)
     {
         char *token;
-        // IP addr and port are separated by a space
-        const char delimiter[] = " ";
+        // Fields separated by space or newline char
+        const char delimiter[] = " \n";
         // Extract token delimited by the space
         token = strtok(line, delimiter);
         // Copy the ip address into the structure
@@ -137,19 +44,22 @@ void read_file(char file_name[], struct Drone drones[], int* num_drones, int* my
         int drone_port = strtol(token, NULL, 10);
         // Grab the drone location
         token = strtok(NULL, delimiter);
-        // Remove the newline character
-        token[strlen(token) - 1] = '\0';
         // If it's my port
-        if(port_number == drone_port)
+        if(args->port_number == drone_port)
         {
             // Record my location
-            *my_location = strtol(token, NULL, 10);
-            printf("Location is %d\n", *my_location);
+            args->my_location = strtol(token, NULL, 10);
+            printf("Location is %d\n", args->my_location);
             // Calculate my coordinates
-            my_coordinates = calculate_coordinates(*my_location);
+            args->my_coordinates = calculate_coordinates(args->my_location, args);
         }
-        drones[*num_drones].id = *num_drones;
+        // in_path used to keep track of drones already in send-path.
+        // This ensures that we won't resend message to drone that's 
+        // already received the message
+        drones[*num_drones].in_path = 0;
+        // The sequence number for each drone will start at 1
         drones[*num_drones].seq_num = 1;
+        // Keep track of the number of drones
         (*num_drones)++;
     }
     // Ensure the file is closed when finished
@@ -159,9 +69,9 @@ void read_file(char file_name[], struct Drone drones[], int* num_drones, int* my
 int send_message(int sock_desc, struct sockaddr_in drone_addr, char msg[])
 {
     int rc;
-    char buffer_out[512];
+    char buffer_out[MAX_LEN];
     // Clear the buffer
-    memset(buffer_out, 0, 512);
+    memset(buffer_out, 0, MAX_LEN);
     // Copy the message to the buffer
     sprintf(buffer_out, "%s", msg);
     // Send buffer to the server
@@ -173,7 +83,7 @@ int send_message(int sock_desc, struct sockaddr_in drone_addr, char msg[])
 void is_port_a_num(char port_num[])
 {
     // Iterate through each character
-    for(int i = 0; i <strlen(port_num); i++)
+    for(int i = 0; i < strlen(port_num); i++)
     {
         // Ensure each character is a digit
         if (!isdigit(port_num[i]))
@@ -207,31 +117,21 @@ void configure_address_struct(struct sockaddr_in *drone_addr, int port_num, char
         drone_addr->sin_addr.s_addr = INADDR_ANY;
 }
 
-void receive_message(int sock_desc, struct Drone drones[], int* num_drones, int* my_location) {
+void receive_message(int sock_desc, struct Drone drones[], int* num_drones, struct Args *args) {
     int rc;
     struct sockaddr_in from_address;  /* address of sender */
-    char buffer_received[512]; // used in recvfrom
+    char buffer_received[MAX_LEN]; // used in recvfrom
     int flags = 0; // used for recvfrom
     socklen_t from_length;
-    // Each instance of the server needs its own
-    // unique file name (if it's ran on the same machine), so the port number is
-    // used to create a unique file name for the drone. This is necessary as the lex scanner needs
-    // each line sent from the client to be written to a file for analysis. If each instance
-    // of the server uses the same file this will cause incorrect results since they
-    // are attempting to read and write to the same file simultaneously
-    char file[10];
-    sprintf(file, "%d", port_number);
-    // Add the .txt extension to the file name
-    strcat(file, ".txt");
 
     // from_length must have an initial value
     from_length = sizeof(struct sockaddr_in);
     // Assume the message isn't for me until I confirm the port
     // number in the message
-    is_my_message = 0;
+    args->is_my_message = 0;
     // Clear the buffer in each iteration
-    memset (buffer_received, 0, 512);
-    rc = recvfrom(sock_desc, buffer_received, 512, flags,
+    memset (buffer_received, 0, MAX_LEN);
+    rc = recvfrom(sock_desc, buffer_received, MAX_LEN, flags,
                   (struct sockaddr *) &from_address, &from_length);
     // Exit if there was an issue with the receive
     if(rc < 0)
@@ -239,49 +139,11 @@ void receive_message(int sock_desc, struct Drone drones[], int* num_drones, int*
         perror("Issue receiving bytes.\n");
         exit(1);
     }
-    parse_text(buffer_received, file);
-    /* Three cases:
-     * 1) If the message is meant for me, is in range and still alive, print the message and send an ACK to every drone
-     * 2) If the message for me is an ACK sent from another drone (from a message I sent), print the message but dont resend
-     * 3) Otherwise, if the message is meant for another drone, is in range and still alive,
-     *    forward the message to every drone in the network (before sending the message, replace
-     *    the fromLocation field with my location and decrement the TTL field. */
-    if(is_my_message && is_in_range && is_alive)
-    {
-        // If receiving an ACK message for previously sent message
-        if(is_an_ack())
-        {
-            // Process the ACK message
-            receive_ack(drones, num_drones, my_location);
-        }
-        // Else the message is not an ACK message
-        else
-        {
-            // Process the (non-ACK) message and be sure it's what we expect
-            // based on the sequence number for that particular drone
-            is_expected_message(drones, num_drones, my_location);
-            // If the message sent contains a msg field, 
-            // an ACK needs to be sent to the sending drone
-            if(has_message())
-            {
-                // Create ACK fields
-                create_ack_message(buffer_received, my_location);
-                send_to_drones(buffer_received, sock_desc, drones, num_drones);
-            }
-        }
-    }
-    // If the message isn't for me but is still in range and alive
-    else if(!is_my_message && is_in_range && is_alive)
-    {
-        // Update the fields in the message with my information
-        modify_fields(buffer_received, my_location);
-        send_to_drones(buffer_received, sock_desc, drones, num_drones);
-    }
-    // Clear the struct storing the key-value pairs by
-    // setting num_of_pairs to 0. This will ensure the previous
-    // data will get overwritten when the next line is received
-    // and processed
-    num_of_pairs = 0;
+    // parse_text will call yylex() to extract key-value pairs
+    // from the message and take the appropriate action
+    parse_text(buffer_received, args);
+    // Process the message based on the message type
+    process_msg_type(buffer_received, sock_desc, drones, num_drones, args);
 }
 
 /* Note: the lex scanner requires input from the console or from a file.
@@ -291,56 +153,71 @@ void receive_message(int sock_desc, struct Drone drones[], int* num_drones, int*
  * to open the file in write mode to write to the file, then open it again in
  * read mode for the scanner itself
  * */
-void parse_text(char msg[], char file_name[]) {
+void parse_text(char msg[], struct Args *args) {
     // Extern variables defined in lex.yy.c
     extern int yylex();
     extern FILE *yyin;
+    
+    // Each instance of the server needs its own
+    // unique file name (if it's ran on the same machine), so the port number is
+    // used to create a unique file name for the drone. This is necessary as the lex scanner needs
+    // each line sent from the client to be written to a file for analysis. If each instance
+    // of the server uses the same file this will cause incorrect results since they
+    // are attempting to read and write to the same file simultaneously
+    char file[10];
+    sprintf(file, "%d", args->port_number);
+    // Add the .txt extension to the file name
+    strcat(file, ".txt");
+    
     // Open the file in write mode
-    yyin = fopen(file_name, "w");
+    yyin = fopen(file, "w");
     // Print contents of message to file
     fprintf(yyin, "%s", msg);
     fclose(yyin);
 
     // Open the file in read mode
-    yyin = fopen(file_name, "r");
+    yyin = fopen(file, "r");
     // Pass file to the scanner for analysis
-    yylex();
+    yylex(args);
     fclose(yyin);
 }
 
-void format_pair(char* key_val_pair) {
+void format_pair(char* key_val_pair, struct Args *args) {
     char *token;
     const char delimiter[] = ":";
 
     // Extract token delimited by the colon
     token = strtok(key_val_pair, delimiter);
     // Copy the first token (key) to pairs.keys struct
-    strcpy(pairs.keys[num_of_pairs], token);
+    strcpy(args->pairs.keys[args->num_of_pairs], token);
     // Get the next token (value)
     token = strtok(NULL, delimiter);
     // Copy the token to pairs.values struct
-    strcpy(pairs.values[num_of_pairs], token);
-    num_of_pairs++;
+    strcpy(args->pairs.values[args->num_of_pairs], token);
+    args->num_of_pairs++;
 }
 
-void print_pairs(int my_location) {
+void print_pairs(struct Args *args) {
     // Print all key-value pairs
-    printf("\t\t    ------------------------------------------\n");
+    printf("\n\t\t    ------------------------------------------\n");
     printf("\t\t%20s", "myLocation");
-    printf("%20d\n", my_location);
-    for(int i = 0; i < num_of_pairs; i++)
+    printf("%20d\n", args->my_location);
+    for(int i = 0; i < args->num_of_pairs; i++)
     {
         // Print the key
-        printf("\t\t%20s", pairs.keys[i]);
+        printf("\t\t%20s", args->pairs.keys[i]);
         // Print the value
-        printf("%20s\n", pairs.values[i]);
+        printf("%20s\n", args->pairs.values[i]);
     }
     printf("\t\t    ------------------------------------------\n");
 }
 
-void create_message(char msg[], char* line, char port[], int* my_location, struct Drone drones[], int* num_drones) {
+void create_reg_message(char msg[], char* line, char port[], struct Args *args, struct Drone drones[], int* num_drones) {
     char tmp[20];
+    // Clear the msg buffer
+    memset(msg, 0, MAX_LEN);
     
+    strcat(msg, "msg:\"");
     // Add the message field
     strcat(msg, line);
     // Add the closing quote
@@ -355,17 +232,17 @@ void create_message(char msg[], char* line, char port[], int* my_location, struc
     // Add the fromPort field
     strcat(msg, "fromPort:");
     // Convert from_port to string and store in temp
-    sprintf(tmp, "%d", port_number);
+    sprintf(tmp, "%d", args->port_number);
     strcat(msg, tmp);
     strcat(msg, " ");
 
     // Add the version field
-    strcat(msg, "version:6 ");
+    strcat(msg, "version:7 ");
 
     // Add the location field
-     strcat(msg, "location:");
+    strcat(msg, "location:");
     // Convert location to a string and store in tmp
-    sprintf(tmp, "%d", *my_location);
+    sprintf(tmp, "%d", args->my_location);
     // Add location to message
     strcat(msg, tmp);
     strcat(msg, " ");
@@ -379,7 +256,7 @@ void create_message(char msg[], char* line, char port[], int* my_location, struc
     // Add the send-path field
     strcat(msg, " send-path:");
     // Convert my port to a string and store in tmp
-    sprintf(tmp, "%d ", port_number);
+    sprintf(tmp, "%d ", args->port_number);
     // Add my port number to the message
     strcat(msg, tmp);
     
@@ -412,7 +289,7 @@ void create_message(char msg[], char* line, char port[], int* my_location, struc
 }
 
 
-struct Coordinates calculate_coordinates(int location) { 
+struct Coordinates calculate_coordinates(int location, struct Args *args) { 
     int row_num = -1;
     int col_num;
     /* Continuously subtract the number of columns from the grid location. Each time
@@ -422,7 +299,7 @@ struct Coordinates calculate_coordinates(int location) {
     {
         // Index starts from 0 so we subtract 1
         col_num = location - 1;  
-        location -= num_cols;  
+        location -= args->num_cols;  
         row_num++;
     }
     struct Coordinates coordinates;
@@ -432,14 +309,13 @@ struct Coordinates calculate_coordinates(int location) {
     return coordinates;
 }
 
-void listen_for_input(int sock_desc, struct Drone drones[], int* num_drones, int* my_location) {
+void listen_for_input(int sock_desc, struct Drone drones[], int* num_drones, struct Args *args) {
     // For the select
     fd_set socket_fds; // The socket descriptor set
     int max_sd; // Tells the OS how many sockets are set
-    struct sockaddr_in to_address; /* my address */
-    int rc; // always need to check return codes!
+    int rc;
 
-    printf("Type message: \n");
+    input_msg();
     // Continue forever (until the drone is turned off)
     for(;;)
     {
@@ -461,144 +337,98 @@ void listen_for_input(int sock_desc, struct Drone drones[], int* num_drones, int
         }
         // If message was received from console
         if(FD_ISSET(STDIN, &socket_fds))
-        {
-            size_t len = 0; /* size of the line buffer */
-            char *line = NULL;
-            // Read the line from console and continue if no errors
-            if(getline(&line, &len, stdin) != -1)
-            {
-                // Remove the new line character
-                line[strlen(line) - 1] = '\0';
-                char msg[512];
-                // Prompt the user to enter destination port. This value
-                // will be appended to the message send to each drone in the network
-                char destination_port[6];
-                printf("What port number is this message destined for?\n");
-                scanf("%s", destination_port);
-                // Consume the newline character (when user presses enter)
-                getchar();
-                // Send each line to all the drones in the network
-                for(int i = 0; i < *num_drones; i++)
-                {
-                    // Don't send to myself
-                    if (drones[i].port_number != port_number)
-                    {
-                        // Clear the msg buffer in each iteration
-                        memset(msg, 0, 512);
-                        // Add the beginning part of the message
-                        strcat(msg, "msg:\"");
-                        configure_address_struct(&to_address, drones[i].port_number, drones[i].drone_ip);
-                        // Send the message to the ith drone
-                        create_message(msg, line, destination_port, my_location, drones, num_drones);
-                        rc = send_message(sock_desc, to_address, msg);
-                        // Check for any errors
-                        if (rc < 0)
-                        {
-                            printf("Issue sending message to drone.\n");
-                            exit(1);
-                        }
-                    }
-                }
-            }
-            else
-            {
-                printf("Error reading from console!\n");
-                exit(1);
-            }
-        }
+            create_message(sock_desc, drones, num_drones, args);
         // If a message is being sent over the network
         if(FD_ISSET(sock_desc, &socket_fds))
-        {
             // Start receiving message from the server
-            receive_message(sock_desc, drones, num_drones, my_location);
-        }
+            receive_message(sock_desc, drones, num_drones, args);
     }
 }
 
-void modify_fields(char message[], int* my_location) {
-    memset(message, 0, 512);
-    for(int i = 0; i < num_of_pairs; i++)
+void modify_fields(char message[], struct Args *args) {
+    memset(message, 0, MAX_LEN);
+    for(int i = 0; i < args->num_of_pairs; i++)
     {
         char temp[20];
         // Evaluates to true if key matches 'send-path'
-        if(!strcmp(pairs.keys[i], "send-path")) 
+        if(!strcmp(args->pairs.keys[i], "send-path")) 
         {
             // Add port number to send path
-            sprintf(temp, ",%d ", port_number);
-            strcat(pairs.values[i], temp);
-            strcat(message, pairs.keys[i]);
+            sprintf(temp, ",%d ", args->port_number);
+            strcat(args->pairs.values[i], temp);
+            strcat(message, args->pairs.keys[i]);
             strcat(message, ":");
-            strcat(message, pairs.values[i]);
+            strcat(message, args->pairs.values[i]);
             continue;
         }
         // Evaluates to true if key matches 'TTL'
-        else if(!strcmp(pairs.keys[i], "TTL"))
+        else if(!strcmp(args->pairs.keys[i], "TTL"))
         {
-            int ttl = atoi(pairs.values[i]);
+            int ttl = atoi(args->pairs.values[i]);
             ttl--;
             sprintf(temp, "%d", ttl);
-            strcpy(pairs.values[i], temp);
-            strcat(message, pairs.keys[i]);
+            strcpy(args->pairs.values[i], temp);
+            strcat(message, args->pairs.keys[i]);
             strcat(message, ":");
-            strcat(message, pairs.values[i]);
+            strcat(message, args->pairs.values[i]);
             strcat(message, " ");
             continue;
         }
         // Evaluates to true if key matches 'location'
-        else if(!strcmp(pairs.keys[i], "location"))
+        else if(!strcmp(args->pairs.keys[i], "location"))
         {
-            sprintf(temp, "%d ", *my_location);
-            strcpy(pairs.values[i], temp);
-            strcat(message, pairs.keys[i]);
+            sprintf(temp, "%d ", args->my_location);
+            strcpy(args->pairs.values[i], temp);
+            strcat(message, args->pairs.keys[i]);
             strcat(message, ":");
-            strcat(message, pairs.values[i]);
+            strcat(message, args->pairs.values[i]);
             strcat(message, " ");
             continue;
         }
         else
         {
             // Append the other fields without any changes
-            strcat(message, pairs.keys[i]);
+            strcat(message, args->pairs.keys[i]);
             strcat(message, ":");
-            strcat(message, pairs.values[i]);
+            strcat(message, args->pairs.values[i]);
             strcat(message, " ");
         }
     }
 }
 
 // Return 0 if false and 1 if true
-int has_message() {
+int has_message(struct Args *args) {
     // Iterate through all the pairs
-    for(int i = 0; i < num_of_pairs; i++)
+    for(int i = 0; i < args->num_of_pairs; i++)
         // If the message has a msg field
-        if(!strncmp(pairs.keys[i], "msg", 3))
+        if(!strncmp(args->pairs.keys[i], "msg", 3))
             return 1;
     return 0;
 }
 
-void create_ack_message(char message[], int* my_location) {
+void create_ack_message(char message[], struct Args *args) {
     // Clear the message
-    memset(message, 0, 512);
+    memset(message, 0, MAX_LEN);
     // Add the type to message
     strcpy(message, "type:ACK ");
     char temp[10];
     int index_from_port = 0;
     int index_to_port = 0;
-    for(int i = 0; i < num_of_pairs; i++)
+    for(int i = 0; i < args->num_of_pairs; i++)
     {
        // If the key is not 'msg'
-       if(strcmp(pairs.keys[i], "msg"))
+       if(strcmp(args->pairs.keys[i], "msg"))
        {
             // Update the send-path by adding my port
-            if(!strcmp(pairs.keys[i], "send-path"))
+            if(!strcmp(args->pairs.keys[i], "send-path"))
             {
                 char temp[18];
-                sprintf(temp, "%d ", port_number);
+                sprintf(temp, "%d ", args->port_number);
                 strcat(message, "send-path:");
                 strcat(message, temp);
             }
             // We want to swap the toPort and fromPort fields
-            else if(!strcmp(pairs.keys[i], "toPort"))
+            else if(!strcmp(args->pairs.keys[i], "toPort"))
             {
                 index_to_port = i;
                 // Check to see if the index_from_port field was set.
@@ -606,24 +436,24 @@ void create_ack_message(char message[], int* my_location) {
                 if(index_from_port)
                 {
                     // Swap the toPort and fromPort fields
-                    strcpy(temp, pairs.values[index_from_port]);
-                    strcpy(pairs.values[index_from_port], pairs.values[index_to_port]);
-                    strcpy(pairs.values[index_to_port], temp);
+                    strcpy(temp, args->pairs.values[index_from_port]);
+                    strcpy(args->pairs.values[index_from_port], args->pairs.values[index_to_port]);
+                    strcpy(args->pairs.values[index_to_port], temp);
                     
                     // Append the toPort field to the message
-                    strcat(message, pairs.keys[index_to_port]);
+                    strcat(message, args->pairs.keys[index_to_port]);
                     strcat(message, ":");
-                    strcat(message, pairs.values[index_to_port]);
+                    strcat(message, args->pairs.values[index_to_port]);
                     strcat(message, " ");
                     // Append the fromPort field to the message
-                    strcat(message, pairs.keys[index_from_port]);
+                    strcat(message, args->pairs.keys[index_from_port]);
                     strcat(message, ":");
-                    strcat(message, pairs.values[index_from_port]);
+                    strcat(message, args->pairs.values[index_from_port]);
                     strcat(message, " ");
                 }
             }
             // We want to swap the toPort and fromPort fields
-            else if(!strcmp(pairs.keys[i], "fromPort"))
+            else if(!strcmp(args->pairs.keys[i], "fromPort"))
             {
                 index_from_port = i;
                 // Check to see if the index_to_port field was set.
@@ -631,104 +461,81 @@ void create_ack_message(char message[], int* my_location) {
                 if(index_to_port)
                 {
                     // Swap the toPort and fromPort fields
-                    strcpy(temp, pairs.values[index_from_port]);
-                    strcpy(pairs.values[index_from_port], pairs.values[index_to_port]);
-                    strcpy(pairs.values[index_to_port], temp);
+                    strcpy(temp, args->pairs.values[index_from_port]);
+                    strcpy(args->pairs.values[index_from_port], args->pairs.values[index_to_port]);
+                    strcpy(args->pairs.values[index_to_port], temp);
                     
                     // Append the toPort field to the message
-                    strcat(message, pairs.keys[index_to_port]);
+                    strcat(message, args->pairs.keys[index_to_port]);
                     strcat(message, ":");
-                    strcat(message, pairs.values[index_to_port]);
+                    strcat(message, args->pairs.values[index_to_port]);
                     strcat(message, " ");
                     // Append the fromPort field to the message
-                    strcat(message, pairs.keys[index_from_port]);
+                    strcat(message, args->pairs.keys[index_from_port]);
                     strcat(message, ":");
-                    strcat(message, pairs.values[index_from_port]);
+                    strcat(message, args->pairs.values[index_from_port]);
                     strcat(message, " ");
                 }
             }
             // We want to update the location to mine
-            else if(!strcmp(pairs.keys[i], "location"))
+            else if(!strcmp(args->pairs.keys[i], "location"))
             {
-                sprintf(temp, "%d ", *my_location);
+                sprintf(temp, "%d ", args->my_location);
                 strcat(message, "location:");
                 strcat(message, temp);
             }
             // We don't want to add the location as is (we want to add ours).
             // Add the other fields as-is
-            else if(strcmp(pairs.keys[i], "location"))
+            else if(strcmp(args->pairs.keys[i], "location"))
             {
                 // Add the key at index i
-                strcat(message, pairs.keys[i]);
+                strcat(message, args->pairs.keys[i]);
                 // Separate key and value by colon
                 strcat(message, ":");
                 // Add the value
-                strcat(message, pairs.values[i]);
+                strcat(message, args->pairs.values[i]);
                 // Add a space before next key-val pair
                 strcat(message, " ");
-            }
-       }
-    }
-}
-
-int is_an_ack() {
-    // Iterate through all the pairs
-    for(int i = 0; i < num_of_pairs; i++)
-    {
-        // If there's a pair with the type key
-        if(!strcmp(pairs.keys[i], "type"))
-            // Ensure the assoicated value is an ACK
-            if(!strcmp(pairs.values[i], "ACK"))
-                return 1;
-    }
-    return 0;
-}
-
-void send_to_drones(char message[], int sock_desc, struct Drone drones[], int* num_drones) {
-    int rc;
-    struct sockaddr_in to_address; /* address of drone to send to */
-    
-    // For each drone
-    for (int i = 0; i < *num_drones; i++)
-    {
-        // Don't send to myself
-        if (drones[i].port_number != port_number)
-        {
-            configure_address_struct(&to_address, drones[i].port_number, drones[i].drone_ip);
-            // Send the message to the ith drone
-            rc = send_message(sock_desc, to_address, message);
-            // Check for any errors
-            if (rc < 0)
-            {
-                printf("Issue sending message to drone.\n");
-                exit(1);
             }
         }
     }
 }
 
-void receive_ack(struct Drone drones[], int* num_drones, int* my_location) {
+int is_an_ack(struct Args *args) {
+    // Iterate through all the pairs
+    for(int i = 0; i < args->num_of_pairs; i++)
+    {
+        // If there's a pair with the type key
+        if(!strcmp(args->pairs.keys[i], "type"))
+            // Ensure the assoicated value is an ACK
+            if(!strcmp(args->pairs.values[i], "ACK"))
+                return 1;
+    }
+    return 0;
+}
+
+void receive_ack(struct Drone drones[], int* num_drones, struct Args *args) {
     // Iterate through all the message pairs
-    for(int i = 0; i < num_of_pairs; i++)
+    for(int i = 0; i < args->num_of_pairs; i++)
     {
         // Find the send-path
-        if(!strcmp(pairs.keys[i], "send-path"))
+        if(!strcmp(args->pairs.keys[i], "send-path"))
         {
             char *token;
             // Make a copy of the path (strtok inserts null terminator at delim)
-            char *path_copy = strdup(pairs.values[i]);
+            char *path_copy = strdup(args->pairs.values[i]);
             // Grab the port number of the drone that send the ACK
             token = strtok(path_copy, ",");
             // Convert to an integer
             int port = atoi(token);
             int seq;
             // Find the sequence number associated with the message
-            for(int j = 0; j < num_of_pairs; j++)
+            for(int j = 0; j < args->num_of_pairs; j++)
             {
-                if(!strcmp(pairs.keys[j], "seqNumber"))
+                if(!strcmp(args->pairs.keys[j], "seqNumber"))
                 {
                     // Convert the sequence number to an integer
-                    seq = atoi(pairs.values[j]);
+                    seq = atoi(args->pairs.values[j]);
                     // Iterate through all the drones
                     for(int k = 0; k < *num_drones; k++)
                     {
@@ -739,8 +546,8 @@ void receive_ack(struct Drone drones[], int* num_drones, int* my_location) {
                             if(drones[k].seq_num == seq)
                             {
                                 // If so, print the message
-                                print_pairs(*my_location);
-                                printf("Type message:\n");
+                                print_pairs(args);
+                                input_msg();
                                 // Expecting seq_num++ in next message sent
                                 // from the same drone
                                 drones[k].seq_num++;
@@ -753,18 +560,18 @@ void receive_ack(struct Drone drones[], int* num_drones, int* my_location) {
     }
 }
 
-void is_expected_message(struct Drone drones[], int* num_drones, int* my_location) {
+int is_expected_message(struct Drone drones[], int* num_drones, struct Args *args) {
     int from;
     int seq;
     // Iterate through all pairs in the message
-    for(int i = 0; i < num_of_pairs; i++)
+    for(int i = 0; i < args->num_of_pairs; i++)
     {
         // Find the sequence number assocated with the message
-        if(!strcmp(pairs.keys[i], "seqNumber"))
-            seq = atoi(pairs.values[i]);
+        if(!strcmp(args->pairs.keys[i], "seqNumber"))
+            seq = atoi(args->pairs.values[i]);
         // Find the fromPort assoicated with the message
-        else if(!strcmp(pairs.keys[i], "fromPort"))
-            from = atoi(pairs.values[i]);
+        else if(!strcmp(args->pairs.keys[i], "fromPort"))
+            from = atoi(args->pairs.values[i]);
     }  
     // Iterate through all the drones
     for(int j = 0; j < *num_drones; j++)
@@ -777,11 +584,200 @@ void is_expected_message(struct Drone drones[], int* num_drones, int* my_locatio
             // each message sent from that drone)
             if(drones[j].seq_num == seq)
             {
-                print_pairs(*my_location);
-                printf("Type message:\n");
+                print_pairs(args);
+                input_msg();
                 drones[j].seq_num++;
+                return 1;
             }
         }
-    }      
+    } 
+    return 0;     
 }
+
+void input_msg() {
+    printf("\nYou can either type a message or a move command. In the case\n"
+           "of a message, you can simply type the message. If you'd like\n"
+           "to have a drone move to a different location, type the location\n"
+           "(integer value).\n");
+    printf(">> ");
+    fflush(STDIN);
+}
+
+void create_message(int sock_desc, struct Drone drones[], int* num_drones, struct Args *args) {
+    size_t len = 0; /* size of the line buffer */
+    char *line = NULL;
+    // Read the line from console and continue if no errors
+    if(getline(&line, &len, stdin) != -1)
+    {
+        // Remove the new line character
+        line[strlen(line) - 1] = '\0';
+        char msg[MAX_LEN];
+        int user_choice;
+        // Prompt the user to enter destination port. This value
+        // will be appended to the message send to each drone in the network
+        char destination_port[6];
+        printf("What port number is this message destined for?\n>> ");
+        scanf("%s", destination_port);
+        printf("Is this a message (0) or a move command (1)?\n>> ");
+        scanf("%d", &user_choice);
+        // Consume the newline character (when user presses enter)
+        getchar();
+        // 2 different cases based on the user_choice
+        switch(user_choice)
+        {
+            // If the user selected to send a message
+            case(MSG):
+            {
+                create_reg_message(msg, line, destination_port, args, drones, num_drones);
+                // Send message to all the drones in the network
+                send_to_drones(msg, sock_desc, drones, num_drones, args);
+                input_msg();
+                break;
+            }
+            // If the user selected to send a move commmand
+            case(MOV):
+            {
+                int rc;
+                struct sockaddr_in to_address;
+                create_reg_message(msg, line, destination_port, args, drones, num_drones);
+                strcat(msg, " move:");
+                // Append the location that we want the drones to move to
+                strcat(msg, line);
+                for(int i = 0; i < *num_drones; i++)
+                {
+                    // Send to specific drone only
+                    if(drones[i].port_number == atoi(destination_port))
+                    {
+                        configure_address_struct(&to_address, drones[i].port_number, drones[i].drone_ip);
+                        rc = send_message(sock_desc, to_address, msg);
+                        if (rc < 0)
+                        {
+                            printf("Issue sending message to drone.\n");
+                            exit(1);
+                        }
+                    }
+                }
+                input_msg();
+                break;
+            }
+            // Invalid user_choice
+            default:
+            {
+                printf("Invalid message type. Exiting program now\n");
+                exit(1);
+            }
+        }
+    }
+    else
+    {
+        printf("Error reading from console!\n");
+        exit(1);
+    }
+}
+
+void send_to_drones(char message[], int sock_desc, struct Drone drones[], int* num_drones, struct Args *args) {
+    int rc;
+    struct sockaddr_in to_address; /* address of drone to send to */
+    // Iterate through all the drones
+    for(int i = 0; i < *num_drones; i++)
+    {
+        // Only send to the drones that aren't already in the send path
+        if(!drones[i].in_path && drones[i].port_number != args->port_number)   
+        {  
+            configure_address_struct(&to_address, drones[i].port_number, drones[i].drone_ip);
+            rc = send_message(sock_desc, to_address, message);
+            if (rc < 0)
+            {
+                printf("Issue sending message to drone.\n");
+                exit(1);
+            }
+        }
+        // Reset the in_path
+        drones[i].in_path = 0;
+    }
+}
+
+void process_msg_type(char message[], int sock_desc, struct Drone drones[], int* num_drones, struct Args *args) {
+    /* Four cases:
+     * 1) If the message is a move command, update my location and print a confirmation message
+     * 2) If the message is meant for me, is in range and still alive, print the message and send an ACK to every drone
+     * 3) If the message for me is an ACK sent from another drone (from a message I sent), print the message but dont resend
+     * 4) If the message is meant for another drone, is in range and still alive,
+     *    forward the message to every drone in the network that hasn't received the message (before sending the 
+     *    message, replace the fromLocation field with my location and decrement the TTL field. */ 
+    
+    // Case for move command
+    if(args->is_move_cmd)
+    {
+        printf("Moving to location %d\n", args->my_location);
+        // Recalculate coordinates based on new location
+        args->my_coordinates = calculate_coordinates(args->my_location, args);
+        // Reset for the next message
+        args->is_move_cmd = 0;
+        input_msg();
+    }
+    // Case if the message is meant for me and is still in range and alive
+    else if(args->is_my_message && args->is_in_range && args->is_alive)
+    {
+        // If receiving an ACK message for previously sent message
+        if(is_an_ack(args))
+        {
+            // Process the ACK message
+            receive_ack(drones, num_drones, args);
+        }
+        // Else the message is not an ACK message
+        else
+        {
+            // Process the (non-ACK) message and be sure it's what we expect
+            // based on the sequence number for that particular drone
+            if(is_expected_message(drones, num_drones, args))
+            {
+                // If the message sent contains a msg field, 
+                // an ACK needs to be sent to the sending drone
+                if(has_message(args))
+                {
+                    // Create ACK fields
+                    create_ack_message(message, args);
+                    send_to_drones(message, sock_desc, drones, num_drones, args);
+                }
+            }
+        }
+    }
+    // If the message isn't for me but is still in range and alive
+    else if(!args->is_my_message && args->is_in_range && args->is_alive)
+    {
+        // Update the fields in the message with my information
+        modify_fields(message, args);
+        for(int i = 0; i < args->num_of_pairs; i++)
+        {
+            // Find the send-path key in the pairs
+            if(!strcmp(args->pairs.keys[i], "send-path"))
+            {
+                char *token;
+                // Extract the first port number in the send-path
+                token = strtok(args->pairs.values[i], ",");
+                // While there's still a port number
+                while(token != NULL)
+                {
+                    // Iterate through all the drones
+                    for(int j = 0; j < *num_drones; j++)
+                        // Find the drone that matches to port number in the token
+                        if(drones[j].port_number == atoi(token))
+                            // Drone is in the path already
+                            drones[j].in_path = 1;
+                    // Grab the next port nuber
+                    token = strtok(NULL, args->pairs.keys[i]);
+                }
+            }
+        }
+        // Forward the message
+        send_to_drones(message, sock_desc, drones, num_drones, args);
+    }
+    // Clear the struct storing the key-value pairs by
+    // setting num_of_pairs to 0. This will ensure the previous
+    // data will get overwritten when the next line is received
+    // and processed
+    args->num_of_pairs = 0;
+}
+
 

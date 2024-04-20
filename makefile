@@ -6,7 +6,7 @@ LIBS = -lm # Add your libraries if needed
 
 all: drone
 
-drone: drone.o parse.o
+drone: main.o drone.o parse.o
 	$(CC) -o $@ $(CFLAGS) $^ $(LIBS)
 
 parse.c: parse.l
